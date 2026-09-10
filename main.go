@@ -372,7 +372,7 @@ func (p *ProxyServer) Start() error {
 }
 
 func main() {
-	port := 6080
+	port := 8080
 
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		if p, err := strconv.Atoi(envPort); err == nil {
