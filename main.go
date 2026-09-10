@@ -21,14 +21,12 @@ type ProxyServer struct {
 }
 
 type Evidence struct {
-	Client                  string `json:"client"`
+	Client string `json:"client"`
 
 	// Authentication evidence.
-	// These fields indicate whether an Authorization header was supplied
-	// and whether this server actually enforces authentication.
-	AuthenticationProvided  bool `json:"authentication_provided"`
+	AuthenticationProvided   bool `json:"authentication_provided"`
 	AuthorizationHeaderSeen bool `json:"authorization_header_seen"`
-	AuthenticationEnforced  bool `json:"authentication_enforced"`
+	AuthenticationEnforced   bool `json:"authentication_enforced"`
 
 	// Request-body handling evidence.
 	BodyLimitConfigured bool   `json:"body_limit_configured"`
@@ -41,8 +39,13 @@ type Evidence struct {
 	RSSBefore      uint64 `json:"rss_before_bytes"`
 	RSSPeak        uint64 `json:"rss_peak_bytes"`
 	RSSAfter       uint64 `json:"rss_after_bytes"`
-	ServerDuration string `json:"server_duration"`
-	ErrorsTimeouts uint64 `json:"errors_timeouts"`
+
+	// Timing evidence.
+	ReadAllDuration   string `json:"read_all_duration"`
+	JSONDuration      string `json:"json_processing_duration"`
+	ServerDuration    string `json:"server_duration"`
+
+	Errors uint64 `json:"errors"`
 }
 
 func currentRSS() uint64 {
@@ -122,15 +125,14 @@ func (p *ProxyServer) handleRequest(
 	go monitorRSS(done, &rssPeak)
 
 	// --------------------------------------------------
-	// EXACT CODE PATH UNDER TEST
+	// io.ReadAll timing
 	// --------------------------------------------------
-	//
-	// No http.MaxBytesReader is used.
-	// Therefore the request body is read without an
-	// application-level body-size limit here.
-	//
+
+	readStart := time.Now()
 
 	body, err := io.ReadAll(r.Body)
+
+	readAllDuration := time.Since(readStart)
 
 	// Stop RSS monitoring immediately after ReadAll.
 	close(done)
@@ -147,7 +149,14 @@ func (p *ProxyServer) handleRequest(
 	heapDelta := int64(after.Alloc) - int64(before.Alloc)
 
 	if err != nil {
-		atomic.AddUint64(&p.errors, 1)
+		errorCount := atomic.AddUint64(&p.errors, 1)
+
+		log.Printf(
+			"io.ReadAll ERROR: bytes=%d duration=%s err=%v",
+			len(body),
+			readAllDuration,
+			err,
+		)
 
 		http.Error(
 			w,
@@ -155,28 +164,43 @@ func (p *ProxyServer) handleRequest(
 			http.StatusBadRequest,
 		)
 
+		_ = errorCount
 		return
 	}
 
 	// --------------------------------------------------
 	// AUTHENTICATION EVIDENCE
 	// --------------------------------------------------
-	//
-	// IMPORTANT:
-	//
-	// r.Header.Get("Authorization") != "" only tells us
-	// that the client supplied an Authorization header.
-	//
-	// It does NOT validate the credential.
-	//
-	// This handler does not compare the value against a
-	// token, session, API key, signature, etc.
-	//
-	// Therefore authentication_enforced is explicitly
-	// recorded as false.
-	//
 
-	authorizationProvided := r.Header.Get("Authorization") != ""
+	authorizationProvided :=
+		r.Header.Get("Authorization") != ""
+
+	// --------------------------------------------------
+	// JSON PROCESSING TIMING
+	// --------------------------------------------------
+
+	jsonStart := time.Now()
+
+	if len(body) > 0 && body[0] == '[' {
+		var batch []json.RawMessage
+
+		if err := json.Unmarshal(body, &batch); err != nil {
+			atomic.AddUint64(&p.errors, 1)
+
+			log.Printf(
+				"JSON ERROR: bytes=%d duration=%s err=%v",
+				len(body),
+				time.Since(jsonStart),
+				err,
+			)
+		}
+	}
+
+	jsonDuration := time.Since(jsonStart)
+
+	// --------------------------------------------------
+	// EVIDENCE
+	// --------------------------------------------------
 
 	evidence := Evidence{
 		Client: r.RemoteAddr,
@@ -185,33 +209,22 @@ func (p *ProxyServer) handleRequest(
 		AuthorizationHeaderSeen:  authorizationProvided,
 		AuthenticationEnforced:   false,
 
-		// No application-level request-body limit is
-		// configured before io.ReadAll().
 		BodyLimitConfigured: false,
+		ReadMethod:          "io.ReadAll(r.Body)",
 
-		ReadMethod: "io.ReadAll(r.Body)",
+		Input:     len(body),
+		HeapDelta: heapDelta,
+		Mallocs:   after.Mallocs - before.Mallocs,
 
-		Input:          len(body),
-		HeapDelta:      heapDelta,
-		Mallocs:        after.Mallocs - before.Mallocs,
-		RSSBefore:      rssBefore,
-		RSSPeak:        rssPeak.Load(),
-		RSSAfter:       rssAfter,
+		RSSBefore: rssBefore,
+		RSSPeak:   rssPeak.Load(),
+		RSSAfter:  rssAfter,
+
+		ReadAllDuration: readAllDuration.String(),
+		JSONDuration:    jsonDuration.String(),
 		ServerDuration: time.Since(start).String(),
-		ErrorsTimeouts: atomic.LoadUint64(&p.errors),
-	}
 
-	// --------------------------------------------------
-	// PRESERVE ORIGINAL BATCH-DETECTION BEHAVIOR
-	// --------------------------------------------------
-
-	if len(body) > 0 && body[0] == '[' {
-		var batch []json.RawMessage
-
-		if err := json.Unmarshal(body, &batch); err != nil {
-			evidence.ErrorsTimeouts =
-				atomic.AddUint64(&p.errors, 1)
-		}
+		Errors: atomic.LoadUint64(&p.errors),
 	}
 
 	// --------------------------------------------------
@@ -222,6 +235,12 @@ func (p *ProxyServer) handleRequest(
 
 	if err := json.NewEncoder(w).Encode(evidence); err != nil {
 		atomic.AddUint64(&p.errors, 1)
+
+		log.Printf(
+			"RESPONSE ERROR: %v",
+			err,
+		)
+
 		return
 	}
 
@@ -262,13 +281,13 @@ func (p *ProxyServer) handleRequest(
 	)
 
 	fmt.Printf(
-		"input=%d bytes (%.2f MB)\n",
+		"input=%d bytes (%.2f MiB)\n",
 		evidence.Input,
 		float64(evidence.Input)/(1024*1024),
 	)
 
 	fmt.Printf(
-		"heap_delta=%d bytes (%.2f MB)\n",
+		"heap_delta=%d bytes (%.2f MiB)\n",
 		evidence.HeapDelta,
 		float64(evidence.HeapDelta)/(1024*1024),
 	)
@@ -279,31 +298,41 @@ func (p *ProxyServer) handleRequest(
 	)
 
 	fmt.Printf(
-		"RSS_before=%d bytes (%.2f MB)\n",
+		"RSS_before=%d bytes (%.2f MiB)\n",
 		evidence.RSSBefore,
 		float64(evidence.RSSBefore)/(1024*1024),
 	)
 
 	fmt.Printf(
-		"RSS_peak=%d bytes (%.2f MB)\n",
+		"RSS_peak=%d bytes (%.2f MiB)\n",
 		evidence.RSSPeak,
 		float64(evidence.RSSPeak)/(1024*1024),
 	)
 
 	fmt.Printf(
-		"RSS_after=%d bytes (%.2f MB)\n",
+		"RSS_after=%d bytes (%.2f MiB)\n",
 		evidence.RSSAfter,
 		float64(evidence.RSSAfter)/(1024*1024),
 	)
 
 	fmt.Println(
-		"server_duration:",
+		"io.ReadAll duration:",
+		evidence.ReadAllDuration,
+	)
+
+	fmt.Println(
+		"JSON processing duration:",
+		evidence.JSONDuration,
+	)
+
+	fmt.Println(
+		"total server duration:",
 		evidence.ServerDuration,
 	)
 
 	fmt.Printf(
-		"errors/timeouts=%d\n",
-		evidence.ErrorsTimeouts,
+		"errors=%d\n",
+		evidence.Errors,
 	)
 
 	fmt.Println("==============================================")
@@ -321,7 +350,7 @@ func NewProxyServer(port int) *ProxyServer {
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
 
-		// Intentionally minimal for this experiment.
+		// Diagnostic experiment:
 		//
 		// No authentication enforcement.
 		// No request-body size limit.
@@ -340,33 +369,13 @@ func (p *ProxyServer) Start() error {
 		p.port,
 	)
 
-	log.Println(
-		"authentication: none",
-	)
-
-	log.Println(
-		"authorization header: observed only; not validated",
-	)
-
-	log.Println(
-		"authentication enforcement: false",
-	)
-
-	log.Println(
-		"body limit: none",
-	)
-
-	log.Println(
-		"read method: io.ReadAll(r.Body)",
-	)
-
-	log.Println(
-		"server timeouts: none configured",
-	)
-
-	log.Println(
-		"test range: 600 MB -> 1 GB",
-	)
+	log.Println("authentication: none")
+	log.Println("authorization header: observed only; not validated")
+	log.Println("authentication enforcement: false")
+	log.Println("body limit: none")
+	log.Println("read method: io.ReadAll(r.Body)")
+	log.Println("server timeouts: none configured")
+	log.Println("diagnostic timing: enabled")
 
 	return p.server.ListenAndServe()
 }
