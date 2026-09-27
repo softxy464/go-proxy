@@ -1,0 +1,56 @@
+name: Signer Security Test
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+jobs:
+security-test:
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
+
+  - name: Setup Go
+    uses: actions/setup-go@v5
+    with:
+      go-version-file: go.mod
+      cache: true
+
+  - name: Start test server
+    run: |
+      go run ./cmd/signer-test > server.log 2>&1 &
+      echo $! > server.pid
+
+      for i in {1..30}; do
+        if curl -fsS http://127.0.0.1:8080/ >/dev/null; then
+          echo "Server is ready"
+          break
+        fi
+        sleep 1
+      done
+
+      curl -fsS http://127.0.0.1:8080/
+
+  - name: Run security test
+    run: |
+      go test -v ./internal/app/service/signer \
+        -run '^TestUnauthenticatedSignRPC$' \
+        -count=1
+
+  - name: Show server evidence
+    if: always()
+    run: |
+      cat server.log || true
+
+  - name: Stop test server
+    if: always()
+    run: |
+      if [ -f server.pid ]; then
+        kill "$(cat server.pid)" || true
+      fi
+```
